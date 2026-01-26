@@ -205,3 +205,26 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# 忽略 Python 缓存
+__pycache__/
+*.py[cod]
+
+# 忽略数据集文件夹 (千万别传这个！)
+bdd100k_images_100k/
+bdd100k_labels_release/
+data/
+
+# 忽略训练生成的模型和日志
+experiments/
+*.pth
+*.pt
+*.tar
+
+# 忽略环境配置
+.env
+.venv
+env/
+venv/
+.idea/
+.vscode/
