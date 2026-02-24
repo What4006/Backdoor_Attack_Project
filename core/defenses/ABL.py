@@ -27,30 +27,94 @@ from torchvision.datasets import CIFAR10, MNIST, DatasetFolder
 from ..utils.accuracy import accuracy
 from ..utils.log import Log
 
+class ConfusionMatrix:
+    """流式计算 mIoU 的辅助类"""
+    def __init__(self, num_classes):
+        self.num_classes = num_classes
+        self.mat = None
+
+    def update(self, a, b):
+        # a: pred [B, H, W], b: label [B, H, W]
+        n = self.num_classes
+        if self.mat is None:
+            self.mat = torch.zeros((n, n), dtype=torch.int64, device=a.device)
+        
+        # 忽略 label 为 255 的像素
+        k = (b >= 0) & (b < n)
+        inds = n * b[k].to(torch.int64) + a[k]
+        
+        # 统计混淆矩阵
+        self.mat += torch.bincount(inds, minlength=n**2).reshape(n, n)
+
+    def compute(self):
+        h = self.mat.float()
+        # 计算 IoU: TP / (TP + FP + FN)
+        acc_global = torch.diag(h).sum() / h.sum()
+        acc = torch.diag(h) / h.sum(1)
+        iu = torch.diag(h) / (h.sum(1) + h.sum(0) - torch.diag(h))
+        return acc_global.item(), iu.mean().item() # 返回 Pixel Acc 和 mIoU
+
+def evaluate_segmentation(self, model, dataloader, criterion, device, num_classes):
+    model.eval()
+    conf_mat = ConfusionMatrix(num_classes)
+    total_loss = 0.0
+    total_batches = 0
+    
+    with torch.no_grad():
+        for batch_idx, (data, target) in enumerate(dataloader):
+            data, target = data.to(device), target.to(device)
+            
+            # 1. 前向传播
+            output = model(data) # [B, 10, H, W]
+            
+            # 2. 计算 Loss (Scalar)
+            loss = criterion(output, target)
+            total_loss += loss.item()
+            total_batches += 1
+            
+            # 3. 获取预测结果 (Argmax) -> [B, H, W]
+            pred = torch.argmax(output, dim=1)
+            
+            # 4. 更新混淆矩阵 (流式计算，不存大数组)
+            conf_mat.update(pred, target)
+            
+    # 5. 计算最终指标
+    avg_loss = total_loss / total_batches
+    pixel_acc, miou = conf_mat.compute()
+    
+    return avg_loss, pixel_acc, miou
 
 class LGALoss(nn.Module):
-    def __init__(self, loss, gamma):
-        """The local gradient ascent (LGA) loss used in first phrase (called pre-isolation phrase) in ABL.
-
-        Args:
-            loss (nn.Module): Loss for repaired model training. Please specify the reduction augment in the loss.
-            gamma (float): Lower Bound for repairing model    
-        """
-        super().__init__()
-        self.loss = loss
+    """
+    [修改版] 适配语义分割的 LGA Loss
+    逻辑：将像素级 Loss 聚合为图片级 Loss，统一判断整张图的去留。
+    """
+    def __init__(self, criterion, gamma):
+        super(LGALoss, self).__init__()
+        self.criterion = criterion  # 确保外部传入的是 reduction='none'
         self.gamma = gamma
+
+    def forward(self, output, target):
+        # 1. 计算像素级 Loss [B, H, W]
+        loss_pixel = self.criterion(output, target)
         
-        if not hasattr(loss, 'reduction'):
-            raise ValueError("Loss module must have the attribute named reduction!")
-        if loss.reduction not in ['none', 'mean']:
-            raise NotImplementedError("This loss only support loss.reduction='mean' or loss.reduction='none'")
-    
-    def forward(self, logits, targets):
-        loss = self.loss(logits, targets)
-        if self.loss.reduction=='none':
-            loss = loss.mean()    
-        loss = torch.sign(loss-self.gamma) * loss  
-        return loss
+        # 2. 聚合：计算每张图的平均 Loss [B]
+        # 这一步是原来没有的，也是为了分割必须加的
+        loss_img = loss_pixel.mean(dim=(1, 2))
+        
+        # 3. 判断：生成符号向量 [B]
+        # Loss < Gamma (简单/有毒) -> -1 (梯度上升)
+        # Loss > Gamma (困难/良性) -> +1 (梯度下降)
+        loss_sign = torch.sign(loss_img - self.gamma)
+        
+        # 4. 广播：把符号扩展回像素级 [B, 1, 1]
+        loss_sign = loss_sign.view(-1, 1, 1)
+        
+        # 5. 应用：整张图的所有像素乘以同一个符号
+        final_loss = loss_sign * loss_pixel
+        
+        # 6. 返回标量
+        return final_loss.mean()
 
 class TensorsDataset(torch.utils.data.Dataset):
 
@@ -280,33 +344,56 @@ class ABL(Base):
         return indices[:num_poisoned].to(originial_device), indices[num_poisoned:].to(originial_device)
 
     def _test(self, model, dataset, device, batch_size=16, num_workers=8):
+        # 1. 定义混淆矩阵工具 (用于流式计算 mIoU)
+        # 如果你没有单独的文件，就把 ConfusionMatrix 类定义贴在文件最上面
+        conf_mat = ConfusionMatrix(num_classes=10) 
+        
+        model = model.to(device)
+        model.eval()
+
+        test_loader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=False, 
+            num_workers=num_workers, drop_last=False, pin_memory=True
+        )
+
+        total_loss = 0.0
+        total_batches = 0
+        
+        # 定义验证用的 Loss (reduction='mean')
+        criterion_val = torch.nn.CrossEntropyLoss(reduction='mean', ignore_index=255)
+
         with torch.no_grad():
-            test_loader = DataLoader(
-                dataset,
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=num_workers,
-                drop_last=False,
-                pin_memory=True,
-                worker_init_fn=self._seed_worker
-            )
-
-            model = model.to(device)
-            model.eval()
-
-            predict_digits = []
-            labels = []
             for batch in test_loader:
                 batch_img, batch_label = batch
                 batch_img = batch_img.to(device)
-                batch_img = model(batch_img)
-                batch_img = batch_img.cpu()
-                predict_digits.append(batch_img)
-                labels.append(batch_label)
+                batch_label = batch_label.to(device) # [B, H, W]
 
-            predict_digits = torch.cat(predict_digits, dim=0)
-            labels = torch.cat(labels, dim=0)
-            return predict_digits, labels     
+                # --- 核心修改区 ---
+                
+                # 1. 推理
+                output = model(batch_img) # [B, 10, H, W]
+
+                # 2. 计算 Loss (累加标量，不占内存)
+                loss = criterion_val(output, batch_label)
+                total_loss += loss.item()
+                total_batches += 1
+
+                # 3. 获取预测 Mask [B, H, W]
+                # 这一步会产生大张量，但马上就会被用掉并释放
+                pred = torch.argmax(output, dim=1) 
+
+                # 4. 更新混淆矩阵 (核心！算完就扔，不 append 到列表)
+                conf_mat.update(pred, batch_label)
+                
+                # 这里的 pred 和 output 在进入下一次循环前会被 Python 自动回收
+                # ----------------
+
+        # 循环结束，一次性计算最终指标
+        avg_loss = total_loss / total_batches
+        pixel_acc, miou = conf_mat.compute()
+
+        # 返回的是轻量级的 float，不再是巨大的 Tensor
+        return avg_loss, pixel_acc, miou
 
     def test(self, model, dataset, schedule=None):
         """Uniform test API for any model and any dataset.
@@ -338,11 +425,9 @@ class ABL(Base):
         else:
             device = torch.device("cpu")
 
-        predict_digits, labels = self._test(model, dataset, device, schedule['batch_size'], schedule['num_workers'])
-        total_num = labels.size(0)
-        prec1, prec5 = accuracy(predict_digits, labels, topk=(1, 5))
-        loss = self.loss(predict_digits, labels)
-        return loss, prec1, prec5, total_num
+        val_loss, val_acc, val_miou = self._test(model, dataset, device, schedule['batch_size'], schedule['num_workers'])
+        print(f"Validation mIoU: {val_miou:.4f}")
+        return val_loss, val_acc, val_miou
 
     def _train(self, dataset, schedule, loss=None, unlearning=False):
         """
@@ -425,7 +510,7 @@ class ABL(Base):
                 iteration += 1
 
                 if iteration % self.current_schedule['log_iteration_interval'] == 0:
-                    msg = time.strftime("[%Y-%m-%d_%H:%M:%S] ", time.localtime()) + f"Epoch:{i+1}/{self.current_schedule['epochs']}, iteration:{batch_id + 1}/{len(dataset)//self.current_schedule['batch_size']}, lr: {optimizer.state_dict()['param_groups'][0]['lr']}, loss: {float(loss)}, time: {time.time()-last_time}\n"
+                    msg = time.strftime("[%Y-%m-%d_%H_%M_%S] ", time.localtime()) + f"Epoch:{i+1}/{self.current_schedule['epochs']}, iteration:{batch_id + 1}/{len(dataset)//self.current_schedule['batch_size']}, lr: {optimizer.state_dict()['param_groups'][0]['lr']}, loss: {float(loss)}, time: {time.time()-last_time}\n"
                     last_time = time.time()
                     log(msg)
                     model.train()
@@ -436,7 +521,7 @@ class ABL(Base):
                 clean_loss, acc, _, _ = self.test(model, self.clean_testset, self.test_schedule)
                 model.train()
                 msg = "==========Test results ==========\n" + \
-                            time.strftime("[%Y-%m-%d_%H:%M:%S] ", time.localtime()) + f"Epoch:{i+1}/{self.current_schedule['epochs']}" +\
+                            time.strftime("[%Y-%m-%d_%H_%M_%S] ", time.localtime()) + f"Epoch:{i+1}/{self.current_schedule['epochs']}" +\
                             " ASR: %.2f Acc: %.2f poison_loss: %.3f clean_loss: %.3f\n"%(asr, acc, poison_loss, clean_loss)
                 log(msg)
 

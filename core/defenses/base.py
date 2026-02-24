@@ -1,42 +1,31 @@
 import os
 import random
-
 import torch
 import numpy as np
 
-
 class Base(object):
-    """Base class for backdoor defense.
-
-    Args:
-        seed (int): Global seed for random numbers. Default: 0.
-        deterministic (bool): Sets whether PyTorch operations must use "deterministic" algorithms.
-            That is, algorithms which, given the same input, and when run on the same software and hardware,
-            always produce the same output. When enabled, operations will use deterministic algorithms when available,
-            and if only nondeterministic algorithms are available they will throw a RuntimeError when called. Default: False.
     """
-
-    def __init__(self, seed=0, deterministic=False):
+    改进后的基类，支持接收 model, criterion 等参数，兼容 ABL_YOLO 的调用。
+    """
+    def __init__(self, model=None, criterion=None, trainset=None, testset=None, args=None, **kwargs):
+        # 1. 保存核心组件
+        self.model = model
+        self.criterion = criterion
+        self.trainset = trainset
+        self.testset = testset
+        self.args = args
+        
+        # 2. 设置随机种子 (优先从 args 中读取，没有则默认 0)
+        seed = getattr(args, 'seed', 0) if args else 0
+        deterministic = getattr(args, 'deterministic', False) if args else False
         self._set_seed(seed, deterministic)
 
     def _set_seed(self, seed, deterministic):
-        # Use torch.manual_seed() to seed the RNG for all devices (both CPU and CUDA).
         torch.manual_seed(seed)
-
-        # Set python seed
         random.seed(seed)
-
-        # Set numpy seed (However, some applications and libraries may use NumPy Random Generator objects,
-        # not the global RNG (https://numpy.org/doc/stable/reference/random/generator.html), and those will
-        # need to be seeded consistently as well.)
         np.random.seed(seed)
-
         os.environ['PYTHONHASHSEED'] = str(seed)
-
         if deterministic:
             torch.backends.cudnn.benchmark = False
             torch.use_deterministic_algorithms(True)
             torch.backends.cudnn.deterministic = True
-            os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-            # Hint: In some versions of CUDA, RNNs and LSTM networks may have non-deterministic behavior.
-            # If you want to set them deterministic, see torch.nn.RNN() and torch.nn.LSTM() for details and workarounds.
